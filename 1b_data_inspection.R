@@ -1,3 +1,12 @@
+# overall view ####
+allabx_data_for_OLS %>% 
+  group_by(date) %>% 
+  summarise(totalDDD = sum(totalDDD),
+            population = sum(population),
+            days_in_month = first(days_in_month)) %>% 
+  ungroup() %>% 
+  mutate(rate = totalDDD*1000/population/days_in_month)
+
 
 # 2 Assessing factors for missingness ####
 # how do prescribers break down by linkage status
