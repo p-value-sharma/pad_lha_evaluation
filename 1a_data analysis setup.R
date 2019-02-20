@@ -34,11 +34,12 @@ hcc_denom_raw <- readxl::read_excel(here::here('data/HCC denominator data_Oct162
   left_join(., lhacoveragelevels %>% 
               select(LHA_NUM, coverageLevel), by = 'LHA_NUM')
 
-write.csv(hcc_denom_raw, file = here::here('intermediates/hcc_denom_pre.csv'), row.names = F)
+write.csv(hcc_denom_raw, file = here::here('intermediates/hcc_denom_pre.csv'), 
+          row.names = F)
 
 
-studyT_to_calendarT <- data.frame(study_time = 0:21, 
-                                  date = seq(from = as.Date('2015-06-01'), 
+studyT_to_calendarT <- data.frame(study_time = -5:21, 
+                                  date = seq(from = as.Date('2015-01-01'), 
                                              to = as.Date('2017-03-01'), by = 'month'))
 
 hcc_denom <- hcc_denom_raw %>% 
@@ -54,7 +55,6 @@ hcc_denom <- hcc_denom_raw %>%
   mutate(days_in_month = lubridate::days_in_month(date), 
          population = as.numeric(population)) %>% 
   select(date, study_time, LHA_NUM, coverageLevel, population, days_in_month) 
-
 
 hcc_denom_coverageLevel <- hcc_denom %>% 
   group_by(date, study_time, coverageLevel) %>% 
@@ -155,9 +155,12 @@ interv_fsa %>%
 
 length(unique(interv_fsa$FSA)) # 190 FSAs in BC, 128 FSA have a nursing home, 88 FSA visited 
 
+allabx_data_pre <- read.csv(file = here::here('intermediates', 'allabx_data_pre')) %>% 
+  mutate(date = as.Date(as.character(date), '%Y-%m-%d'))
 
 
-# 2a Data setup for OLS regression ####
+
+# 2a UTI-linked data setup for OLS regression ####
 data_for_linear_regression <- UTIlinked_data %>% 
   group_by(month, year,  coverageLevel) %>% 
   summarise(totalDDD = sum(DDD), 
@@ -175,10 +178,11 @@ data_for_linear_regression <- UTIlinked_data %>%
   arrange(study_time, coverageLevel) %>% 
   left_join(., hcc_denom_coverageLevel, 
             by = c('coverageLevel', 'date', 'study_time')) %>% 
-  mutate(DOS_rate = 1000*totalDOS/population/days_in_month,
-         rx_n_rate = 1000*totalrx_n/population/days_in_month)
+  mutate_at(vars(starts_with('total')),
+            funs(rate = 1000*./population/days_in_month)) %>% 
+  mutate(intervention = ifelse(coverageLevel == 'Low', 0, 1))
 
-# 2b Data setup for OLS sensitivity analysis ####
+# 2b Data setup for sensitivity analysis ####
 
 sens.approp <- addmargins(xtabs(~ dx + dxgroup, data = pharmanetData))
 sens.approp_nitro_only <- addmargins(xtabs(~ dx + dxgroup, data = pharmanetData[pharmanetData$FINAL_ATC == 'J01XE01',]))
@@ -190,38 +194,46 @@ write.table(sens.approp_nitro_only, here::here('tables/sens.approp_nitro_only.tx
 
 all_months <- tidyr::expand(pharmanetData, LHA_NUM, month, year)
 
-unlinked_nitro <- pharmanetData %>% 
-  filter(dxgroup == 'Unlinked' & FINAL_ATC == 'J01XE01') %>% 
+
+otherdx_and_unlinked_nitro <- pharmanetData %>% 
+  filter(dxgroup != 'UTI-incl symptoms' & FINAL_ATC == 'J01XE01') %>% 
   group_by(coverageLevel, month, year) %>% 
-  summarise(unlinked_nitro_DOS = sum(DSPD_DAYS_SPLY), unlinked_nitro_DDD = sum(DDD),
-            unlinked_nitro_rx_n = n()) %>% 
+  summarise(otherdx_unlinked_nitro_DOS = sum(DSPD_DAYS_SPLY), 
+            otherdx_unlinked_nitro_DDD = sum(DDD),
+            otherdx_unlinked_nitro_rx_n = n()) %>% 
   mutate(date = paste(year, month, '01', sep = '-'),
          date = as.Date(date, format = '%Y-%m-%d')) %>% 
   ungroup() %>% 
   select(-c(month, year))
 
-
 # ‘True’ UTI Rx_N = Total linked Rx_N +
 # Unlinked nitrofurantoin Rx_N * (Prop exclusive use of nitro for UTI) *(1/ Prop nitro of unlinked) 
+constants = c(1, seq(from = 0.8, to = 0.6, by = -0.2))
 
-constants = seq(from = 0.8, to = 0.6, by = -0.1)
 
 # data_for_linear_regression from 2a and unlinked_nitro from 2b
 list_for_sensitivity_analysis <- lapply(X = constants, FUN = function(x) {
   sensitivity_data <- data_for_linear_regression %>% 
-    left_join(., unlinked_nitro, by = c('coverageLevel', 'date')) %>% 
-    rename(linked_rx_n = totalrx_n) %>% 
-    mutate(trueUTI_rx_n = linked_rx_n + unlinked_nitro_rx_n*(1/x), constant = x) %>% 
-    select(coverageLevel, study_time, post_trend, trueUTI_rx_n, constant) %>% 
-    mutate(coverageLevel = factor(coverageLevel, levels = c('Low', 'Medium', 'High'))) %>% 
+    left_join(., otherdx_and_unlinked_nitro, by = c('coverageLevel', 'date')) %>% 
+    rename(linked_rx_n = totalrx_n,
+           linked_DDD = totalDDD,
+           linked_DOS = totalDOS) %>% 
+    mutate(trueUTI_rx_n = linked_rx_n + otherdx_unlinked_nitro_rx_n*(1/x),
+           trueUTI_DDD = linked_DDD + otherdx_unlinked_nitro_DDD*(1/x), 
+           constant = x) %>% 
+    select(coverageLevel, study_time, post_trend, 
+           trueUTI_rx_n, trueUTI_DDD, constant) %>% 
+    mutate(coverageLevel = factor(coverageLevel, 
+                                  levels = c('Low', 'Medium', 'High'))) %>% 
     left_join(., hcc_denom_coverageLevel, 
               by = c('coverageLevel', 'study_time')) %>% 
-    mutate(true_rx_n_rate = 1000*trueUTI_rx_n/population/days_in_month)})
+    mutate(true_rx_n_rate = 1000*trueUTI_rx_n/population/days_in_month,
+           true_DDD_rate = 1000*trueUTI_DDD/population/days_in_month)})
 
-names(list_for_sensitivity_analysis) <- c('perc_80', 'perc_70', 'perc_60')
+names(list_for_sensitivity_analysis) <- c('otherdx_unlinked_nitro', 'perc_80', 'perc_60')
 
 saveRDS(object = list_for_sensitivity_analysis, 
-        file = here::here('intermediates','list_for_sensitivity_analysis_25Sep2018.RDS'))
+        file = here::here('intermediates','list_for_sensitivity_analysis_24Dec2018.RDS'))
 
 unlinked_nitro_prescribers <- pharmanetData %>% 
   filter(dxgroup == 'Unlinked' & FINAL_ATC == 'J01XE01' & date < as.Date('2016-06-01')) %>% 
@@ -290,6 +302,29 @@ unlinked_nitro_prescribers %>%
 
 
 
+
+
+# 2c all abx data setup for OLS regression ####
+allabx_data_for_OLS <- allabx_data_pre %>% 
+  ungroup() %>% 
+  left_join(., subset(lhacoveragelevels, 
+                      select = c("LHA_NUM","coverageLevel")),
+            by = "LHA_NUM") %>% 
+  group_by(coverageLevel, date) %>% 
+  summarise_at(vars(starts_with('total')), funs(sum)) %>% 
+  # there are 22 months in the study
+  # studyT is created in the data import step
+  left_join(., studyT_to_calendarT, by = 'date') %>% 
+  mutate(post_trend = pmax(0, study_time-12,0)) %>% 
+  filter(!is.na(coverageLevel)) %>% 
+  ungroup() %>% 
+  arrange(study_time, coverageLevel) %>% 
+  # adding population
+  left_join(., hcc_denom_coverageLevel, 
+            by = c('coverageLevel', 'date', 'study_time')) %>% 
+  mutate_at(vars(starts_with('total')),
+            funs(rate = .*1000/population/days_in_month)) %>% 
+  mutate(intervention = ifelse(coverageLevel == 'Low', 0, 1))
 
 
 # 3 Setting up data for multilevel analysis ####
@@ -381,6 +416,9 @@ write.csv(x = data_for_linear_regression,
           file = here::here('intermediates', 'data_for_linear_regression.csv'), 
           row.names = F)
 
+write.csv(x = allabx_data_for_OLS, 
+          file = here::here('intermediates', 'allabx_data_for_OLS.csv'), 
+          row.names = F)
 
 
 
@@ -436,6 +474,10 @@ list_for_analysis <- d1 %>%
 # this saves the list, so that the previous code doesn't need to be run again 
 saveRDS(object = list_for_analysis, file = 
           paste(here::here(), 'data/intermediates/list_for_mlm.rds', sep = '/'))
+
+
+
+
 
 
 
